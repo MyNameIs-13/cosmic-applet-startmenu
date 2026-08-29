@@ -1,0 +1,13 @@
+app-title = Start Menu
+app-comment = A classic start menu for the COSMIC panel
+app-keywords = start;menu;launcher;programs;
+start = Start
+search-placeholder = Search programs...
+all-programs = All Programs
+no-results = No programs found
+files = Files
+system-monitor = System Monitor
+settings = Settings
+shut-down = Shut down
+restart = Restart
+suspend = Suspend

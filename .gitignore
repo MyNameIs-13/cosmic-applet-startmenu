@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Nix build output
+/result
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build/dist artifacts (if using just/cargo-deb/flatpak-builder etc.)
+/dist/
+.flatpak-builder/
+build/
+
+# Local agent config / research notes
+.claude/
+docs/research/
+.scratch

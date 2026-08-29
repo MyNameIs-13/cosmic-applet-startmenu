@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Start Menu
+Comment=A classic start menu for the COSMIC panel
+Type=Application
+Icon=io.github.MyNameIs-13.CosmicAppletStartMenu
+Exec=cosmic-applet-startmenu %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=start;menu;launcher;programs;
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+MimeType=
