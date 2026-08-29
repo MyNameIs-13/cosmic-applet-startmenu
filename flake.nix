@@ -78,7 +78,7 @@
             };
           };
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
           buildInputs = runtimeLibs;
 
           # `cargo-auditable`/build.rs already writes desktop/metainfo files
@@ -91,6 +91,16 @@
               $out/share/metainfo/${appId}.metainfo.xml
             install -Dm0644 resources/icons/hicolor/scalable/apps/${appId}.svg \
               $out/share/icons/hicolor/scalable/apps/${appId}.svg
+          '';
+
+          # winit dlopen's libxkbcommon.so.0 (and friends) at runtime rather
+          # than linking them at build time, so cosmic-panel silently fails
+          # to spawn the applet without these on LD_LIBRARY_PATH. Wrap here
+          # so `packages.default` is runnable as-is; consumers shouldn't
+          # need to know this list to use the package.
+          postFixup = ''
+            wrapProgram $out/bin/cosmic-applet-startmenu \
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
           '';
 
           meta = {
@@ -110,5 +120,10 @@
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
         };
       }
-    );
+    )
+    // {
+      overlays.default = final: prev: {
+        cosmic-applet-startmenu = self.packages.${final.system}.default;
+      };
+    };
 }
