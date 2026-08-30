@@ -258,6 +258,7 @@ impl cosmic::Application for AppModel {
                 .on_press(Message::TogglePowerMenu)
                 .class(theme::Button::Standard),
             )
+            .align_y(Alignment::Center)
             .spacing(4);
 
         let sidebar = sidebar.push(shutdown_row).spacing(4).width(Length::Fixed(160.0));
