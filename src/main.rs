@@ -5,6 +5,7 @@ mod domain;
 mod i18n;
 mod infrastructure;
 mod interface;
+mod theme_repair;
 
 use std::sync::Arc;
 
@@ -18,6 +19,9 @@ fn main() -> cosmic::iced::Result {
 
     // Enable localizations to be applied.
     i18n::init(&requested_languages);
+
+    // Work around this system's theme-config schema mismatch (see module docs).
+    theme_repair::heal_missing_defaults();
 
     let service = Arc::new(application::StartMenuService::new(
         Arc::new(infrastructure::XdgDesktopEntryRepository),
