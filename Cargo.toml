@@ -12,7 +12,7 @@ xdgen = "0.1"
 [dependencies]
 i18n-embed-fl = "0.10"
 rust-embed = "8.11"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
 async-trait = "0.1"
 zbus = { version = "5.14", default-features = false, features = ["tokio"] }
 freedesktop-icons = "0.4"
@@ -27,8 +27,9 @@ features = ["fluent-system", "desktop-requester"]
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
+default-features = false
 features = [
-    # Applet support
+    # Applet support (pulls in wayland + winit, which applets need)
     "applet",
     "applet-token",
     # Support creating additional application windows.
@@ -37,11 +38,16 @@ features = [
     "tokio",
     # Detached process spawning (`cosmic::process::spawn`)
     "process",
-    # Add Wayland support to winit
-    "wayland",
-    # Windowing support for X11, Windows, Mac, & Redox
-    "winit",
 ]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
 
 # Uncomment to test a locally-cloned libcosmic
 # [patch.'https://github.com/pop-os/libcosmic']
