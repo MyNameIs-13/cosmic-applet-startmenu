@@ -15,19 +15,25 @@ button that actually shuts down — no confirmation dialog, no countdown.
 ## Status
 
 Builds and passes its unit tests against real `pop-os/libcosmic` (verified
-in this repo's dev environment: `cargo +nightly check`, `cargo +nightly
-clippy`, `cargo +nightly test`, and `cargo +nightly build` all succeed and
-produce a linked binary). It has **not** been run inside an actual COSMIC
-session in this environment (no Wayland compositor available here) — do
-that before relying on it.
+in this repo's dev environment: `nix develop --command cargo check`, `nix
+develop --command cargo clippy`, `nix develop --command cargo test`, and
+`nix develop --command cargo build --release` all succeed and produce a
+linked binary). It has **not** been run inside an actual COSMIC session in
+this environment (no Wayland compositor available here) — do that before
+relying on it.
 
 ## Requirements
 
 - **A nightly Rust toolchain.** `libcosmic`'s `master` branch currently
   declares a newer MSRV than the latest stable `rustc` satisfies (this repo
-  hit `requires rustc 1.93` against stable 1.91.1 while building). Install
-  one with `rustup install nightly`, then build with `cargo +nightly build
-  --release` (or `rustup override set nightly` in this directory).
+  hit `requires rustc 1.93` against stable 1.91.1 while building). This repo's
+  dev environment has no `rustup`, so the `cargo +nightly ...` toolchain
+  selector doesn't work here — `flake.nix`'s `devShells.default` puts a
+  rolling nightly `cargo`/`rustc` (via [fenix](https://github.com/nix-community/fenix))
+  directly on `PATH`. Enter it with `nix develop`, then build with plain
+  `cargo build --release`. If you're using `rustup` instead, install a
+  nightly with `rustup install nightly` and either prefix commands with
+  `cargo +nightly` or run `rustup override set nightly` in this directory.
 - System dev packages for Wayland/X11/GPU/font libraries that `iced`'s
   `wgpu`/`winit` stack link against: `wayland`, `libxkbcommon`, `fontconfig`,
   `freetype`, `expat`, Vulkan/GL loaders, and the X11 client libs. On a
@@ -37,9 +43,12 @@ that before relying on it.
 ## Building
 
 ```sh
-just build-release      # or: cargo +nightly build --release
-just install             # installs the binary, .desktop entry, and icon
+nix develop --command just build-release      # or: cargo build --release
+just install                                   # installs the binary, .desktop entry, and icon
 ```
+
+(Drop the `nix develop --command` prefix if you already have a nightly
+toolchain on `PATH` some other way, e.g. via `rustup`.)
 
 `just install` respects `prefix`/`rootdir` the same way the upstream
 [cosmic-applet-template](https://github.com/pop-os/cosmic-applet-template)
