@@ -12,7 +12,7 @@ xdgen = "0.1"
 [dependencies]
 i18n-embed-fl = "0.10"
 rust-embed = "8.11"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 async-trait = "0.1"
 zbus = { version = "5.14", default-features = false, features = ["tokio"] }
 freedesktop-icons = "0.4"

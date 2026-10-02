@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cosmic::{
     applet::token::subscription::{activation_token_subscription, TokenRequest, TokenUpdate},
     cctk::sctk::reexports::calloop,
     iced::{
-        platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
+        event::{
+            wayland::{Event as WaylandEvent, LayerEvent, PopupEvent},
+            PlatformSpecific,
+        },
+        keyboard, mouse,
+        platform_specific::{
+            runtime::wayland::layer_surface::SctkLayerSurfaceSettings,
+            shell::wayland::commands::{
+                layer_surface::{set_keyboard_interactivity, KeyboardInteractivity, Layer},
+                popup::{destroy_popup, get_popup},
+            },
+        },
         window::Id,
-        Alignment, Length, Limits, Subscription,
+        Alignment, Event, Length, Limits, Subscription,
     },
     prelude::*,
     theme,
@@ -18,7 +30,21 @@ use cosmic::{
 use crate::application::{PowerAction, ProgramEntry, StartIcon, StartMenuService};
 use crate::fl;
 
+use super::search_keys::{self, SearchKey};
 use super::widgets::{program_row, sidebar_item, start_button};
+
+/// How long after the menu was dismissed by losing focus a click on the
+/// Start button is treated as part of that same dismissal. Clicking Start
+/// while the menu is open moves focus away from it — closing it — just
+/// before the click itself arrives; without this, that click would
+/// immediately reopen the menu instead of leaving it closed.
+const REOPEN_GUARD: Duration = Duration::from_millis(400);
+
+/// How long to wait, after one of the menu's surfaces loses keyboard focus,
+/// before deciding focus really left the menu. Focus hops between the
+/// popup and the helper surface (and cosmic-comp briefly focuses the popup
+/// right after it opens), so an unfocus alone isn't proof the user moved on.
+const UNFOCUS_SETTLE: Duration = Duration::from_millis(50);
 
 /// The application model stores app-specific state used to describe its
 /// interface and drive its logic.
@@ -49,6 +75,17 @@ pub struct AppModel {
     /// Whether the Restart/Suspend flyout (behind the little arrow next to
     /// Shut Down, same as the classic Windows menu) is open.
     power_menu_open: bool,
+    /// The invisible helper surface holding keyboard focus while the menu
+    /// is open — see `capture_keyboard`.
+    keyboard_surface: Option<Id>,
+    /// Which of the menu's surfaces (popup or helper) has keyboard focus,
+    /// if either does.
+    focused_surface: Option<Id>,
+    /// Whether the pointer is over the popup; the menu never closes on lost
+    /// focus while the user is pointing at it.
+    pointer_inside_popup: bool,
+    /// When the menu last closed because focus left it — see `REOPEN_GUARD`.
+    dismissed_at: Option<Instant>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -66,6 +103,14 @@ pub enum Message {
     TogglePowerMenu,
     Power(PowerAction),
     PowerResult(Result<(), String>),
+    SurfaceFocused(Id),
+    SurfaceUnfocused(Id),
+    /// Fired `UNFOCUS_SETTLE` after a menu surface lost focus: closes the
+    /// menu if focus hasn't come back to it by then.
+    CloseIfUnfocused(Id),
+    PointerInside(Id, bool),
+    /// A key press the search field itself didn't receive.
+    SearchKey(SearchKey),
 }
 
 fn start_icon_handle(icon: StartIcon) -> icon::Handle {
@@ -116,6 +161,22 @@ fn program_list_pane<'a>(visible: &[ProgramEntry]) -> Element<'a, Message> {
     }
 }
 
+/// Maps the window-level events the menu's focus handling cares about.
+fn surface_event(event: Event, id: Id) -> Option<Message> {
+    match event {
+        Event::Window(cosmic::iced::window::Event::Opened { .. }) => Some(Message::SurfaceOpened(id)),
+        Event::PlatformSpecific(PlatformSpecific::Wayland(
+            WaylandEvent::Layer(LayerEvent::Focused, _, id) | WaylandEvent::Popup(PopupEvent::Focused, _, id),
+        )) => Some(Message::SurfaceFocused(id)),
+        Event::PlatformSpecific(PlatformSpecific::Wayland(
+            WaylandEvent::Layer(LayerEvent::Unfocused, _, id) | WaylandEvent::Popup(PopupEvent::Unfocused, _, id),
+        )) => Some(Message::SurfaceUnfocused(id)),
+        Event::Mouse(mouse::Event::CursorEntered) => Some(Message::PointerInside(id, true)),
+        Event::Mouse(mouse::Event::CursorLeft) => Some(Message::PointerInside(id, false)),
+        _ => None,
+    }
+}
+
 /// Create a COSMIC application from the app model
 impl cosmic::Application for AppModel {
     type Executor = cosmic::executor::Default;
@@ -147,6 +208,10 @@ impl cosmic::Application for AppModel {
             token_tx: None,
             pending_launch: None,
             power_menu_open: false,
+            keyboard_surface: None,
+            focused_surface: None,
+            pointer_inside_popup: false,
+            dismissed_at: None,
         };
 
         (app, Task::none())
@@ -179,7 +244,13 @@ impl cosmic::Application for AppModel {
     /// left, a user/shortcuts sidebar on the right with Shut Down pinned to
     /// its bottom (Restart/Suspend tucked behind the little arrow next to
     /// it, same as the Windows 7 "Classic" menu).
-    fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
+    ///
+    /// Every other surface (the invisible keyboard helper) renders nothing.
+    fn view_window(&self, id: Id) -> Element<'_, Self::Message> {
+        if self.popup != Some(id) {
+            return widget::text::body("").into();
+        }
+
         let visible = self.service.search_programs(&self.programs, &self.search_query);
         let program_list = program_list_pane(&visible);
 
@@ -281,89 +352,92 @@ impl cosmic::Application for AppModel {
     fn subscription(&self) -> Subscription<Self::Message> {
         Subscription::batch([
             activation_token_subscription(0).map(Message::Token),
-            cosmic::iced::event::listen_with(|event, _status, id| {
-                if let cosmic::iced::Event::Window(cosmic::iced::window::Event::Opened { .. }) = event {
-                    Some(Message::SurfaceOpened(id))
-                } else {
-                    None
-                }
-            }),
+            cosmic::iced::event::listen_with(|event, _status, id| surface_event(event, id)),
+            if self.popup.is_some() {
+                cosmic::iced::event::listen_with(|event, status, _id| match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key, modifiers, text, ..
+                    }) => search_keys::interpret(
+                        &key,
+                        modifiers,
+                        text.as_deref(),
+                        status == cosmic::iced::event::Status::Captured,
+                    )
+                    .map(Message::SearchKey),
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            },
         ])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::TogglePopup => {
-                return if let Some(p) = self.popup.take() {
-                    destroy_popup(p)
-                } else {
-                    // The set of installed programs can change while the
-                    // applet is running; refresh it each time the menu opens.
-                    self.programs = self.service.load_programs();
-                    self.search_query.clear();
-                    self.power_menu_open = false;
-
-                    let new_id = Id::unique();
-                    self.popup.replace(new_id);
-                    let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
-                        new_id,
-                        None,
-                        None,
-                        None,
-                    );
-                    popup_settings.positioner.size_limits = Limits::NONE
-                        .max_width(510.0)
-                        .min_width(510.0)
-                        .min_height(300.0)
-                        .max_height(720.0);
-                    // `get_popup_settings` defaults `grab` to `true`, which
-                    // requests an `xdg_popup` grab (using the panel button's
-                    // click serial) — that's meant to give the popup real
-                    // keyboard focus without needing a click on it first.
-                    //
-                    // KNOWN LIMITATION (unresolved as of this comment): on
-                    // cosmic-comp, that grab doesn't actually transfer
-                    // keyboard focus to the popup — typing still requires a
-                    // literal click on the search field first, reproducing
-                    // the originally reported bug. Two things were tried and
-                    // ruled out:
-                    //
-                    // 1. Also setting `KeyboardInteractivity::Exclusive` on
-                    //    the panel button's own layer surface (thinking that
-                    //    would help). It actively made things worse:
-                    //    cosmic-comp's focus-fixup pass
-                    //    (`focus_target_is_valid` in `shell/focus/mod.rs`)
-                    //    treats an `Exclusive` layer surface as the *only*
-                    //    valid keyboard-focus target on its layer, rejecting
-                    //    any `Popup` target outright — even one belonging to
-                    //    that very surface — so the fixup kept reverting
-                    //    focus back to the panel button and force-unsetting
-                    //    the popup's own grab.
-                    // 2. Making the menu its own layer surface instead of a
-                    //    popup (so `Exclusive` interactivity would apply
-                    //    directly, which `focus_target_is_valid` does
-                    //    accept). That hit a different, worse problem in
-                    //    testing: the surface captured keyboard input
-                    //    globally (blocking other apps until Escape) while
-                    //    never actually rendering visibly.
-                    //
-                    // Root-caused as far as an applet can go without tracing
-                    // (or patching) cosmic-comp itself — see the project's
-                    // issue tracker for the write-up to file upstream.
-                    get_popup(popup_settings)
+                if self.popup.is_some() {
+                    return self.close_popup();
                 }
+                if self.dismissed_at.take().is_some_and(|at| at.elapsed() < REOPEN_GUARD) {
+                    return Task::none();
+                }
+                return self.open_popup();
             }
             Message::PopupClosed(id) => {
-                if self.popup.as_ref() == Some(&id) {
+                if self.popup == Some(id) {
                     self.popup = None;
+                    return self.release_keyboard();
                 }
             }
             Message::SurfaceOpened(id) => {
-                if self.popup.as_ref() == Some(&id) {
-                    return widget::text_input::focus(self.search_id.clone()).map(cosmic::Action::App);
+                if self.popup == Some(id) {
+                    return Task::batch([
+                        self.capture_keyboard(),
+                        widget::text_input::focus(self.search_id.clone()).map(cosmic::Action::App),
+                    ]);
                 }
             }
+            Message::SurfaceFocused(id) => {
+                if self.popup == Some(id) {
+                    self.focused_surface = Some(id);
+                } else if self.keyboard_surface == Some(id) {
+                    self.focused_surface = Some(id);
+                    // Focus is ours now; drop back to `OnDemand` so a click
+                    // into the popup (or anywhere else) can still take it.
+                    return set_keyboard_interactivity(id, KeyboardInteractivity::OnDemand);
+                }
+            }
+            Message::SurfaceUnfocused(id) => {
+                if self.popup != Some(id) && self.keyboard_surface != Some(id) {
+                    return Task::none();
+                }
+                if self.focused_surface == Some(id) {
+                    self.focused_surface = None;
+                }
+                if let Some(popup) = self.popup {
+                    return Task::perform(async { tokio::time::sleep(UNFOCUS_SETTLE).await }, move |()| {
+                        cosmic::Action::App(Message::CloseIfUnfocused(popup))
+                    });
+                }
+            }
+            Message::CloseIfUnfocused(popup) => {
+                if self.popup == Some(popup) && self.focused_surface.is_none() && !self.pointer_inside_popup {
+                    self.dismissed_at = Some(Instant::now());
+                    return self.close_popup();
+                }
+            }
+            Message::PointerInside(id, inside) => {
+                if self.popup == Some(id) {
+                    self.pointer_inside_popup = inside;
+                }
+            }
+            Message::SearchKey(key) => match key {
+                SearchKey::Append(text) => self.search_query.push_str(&text),
+                SearchKey::Backspace => {
+                    self.search_query.pop();
+                }
+                SearchKey::Dismiss => return self.close_popup(),
+            },
             Message::Search(query) => {
                 self.search_query = query;
             }
@@ -382,9 +456,7 @@ impl cosmic::Application for AppModel {
                     spawn_program(&entry, None);
                 }
 
-                if let Some(p) = self.popup.take() {
-                    return destroy_popup(p);
-                }
+                return self.close_popup();
             }
             Message::Token(update) => match update {
                 TokenUpdate::Init(tx) => self.token_tx = Some(tx),
@@ -411,6 +483,98 @@ impl cosmic::Application for AppModel {
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
         Some(cosmic::applet::style())
+    }
+}
+
+impl AppModel {
+    fn open_popup(&mut self) -> Task<cosmic::Action<Message>> {
+        // The set of installed programs can change while the applet is
+        // running; refresh it each time the menu opens.
+        self.programs = self.service.load_programs();
+        self.search_query.clear();
+        self.power_menu_open = false;
+        self.focused_surface = None;
+        self.pointer_inside_popup = false;
+
+        let new_id = Id::unique();
+        self.popup = Some(new_id);
+        let mut popup_settings =
+            self.core
+                .applet
+                .get_popup_settings(self.core.main_window_id().unwrap(), new_id, None, None, None);
+        popup_settings.positioner.size_limits = Limits::NONE
+            .max_width(510.0)
+            .min_width(510.0)
+            .min_height(300.0)
+            .max_height(720.0);
+        // No `xdg_popup` grab: cosmic-comp hands a grabbed popup keyboard
+        // focus, then takes it back ~200ms later, so typing went nowhere
+        // until the search field was clicked. Keyboard focus comes from
+        // `capture_keyboard` instead — and a grab would get the popup
+        // dismissed the moment that helper surface takes focus. Without the
+        // grab, closing on an outside click is handled by
+        // `Message::SurfaceUnfocused`.
+        popup_settings.grab = false;
+        get_popup(popup_settings)
+    }
+
+    fn close_popup(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(popup) = self.popup.take() else {
+            return Task::none();
+        };
+        self.focused_surface = None;
+        self.pointer_inside_popup = false;
+        Task::batch([destroy_popup(popup), self.release_keyboard()])
+    }
+
+    /// Takes keyboard focus for the open menu.
+    ///
+    /// cosmic-comp won't let an applet's popup keep keyboard focus without
+    /// a click on it, but it does give focus to a layer surface asking for
+    /// `Exclusive` keyboard interactivity. So the menu opens a 1×1,
+    /// input-transparent, invisible overlay surface that asks for exactly
+    /// that; key presses land there and reach the search query through the
+    /// keyboard subscription (see `search_keys`). The same approach as
+    /// cosmic-ext-applet-clip-keep. Once focused, the helper drops to
+    /// `OnDemand` (see `Message::SurfaceFocused`) so it doesn't trap the
+    /// keyboard.
+    fn capture_keyboard(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.keyboard_surface.is_some() {
+            return Task::none();
+        }
+        let id = Id::unique();
+        self.keyboard_surface = Some(id);
+        cosmic::surface::surface_task(cosmic::surface::action::app_layer_shell::<Self>(
+            |_| cosmic::surface::action::LiveSettings::default(),
+            move |_| keyboard_helper_settings(id),
+            None,
+        ))
+    }
+
+    fn release_keyboard(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(id) = self.keyboard_surface.take() else {
+            return Task::none();
+        };
+        if self.focused_surface == Some(id) {
+            self.focused_surface = None;
+        }
+        cosmic::surface::surface_task(cosmic::surface::action::destroy_layer_shell(id))
+    }
+}
+
+/// The invisible surface `AppModel::capture_keyboard` opens to receive
+/// keyboard focus.
+fn keyboard_helper_settings(id: Id) -> SctkLayerSurfaceSettings {
+    SctkLayerSurfaceSettings {
+        id,
+        layer: Layer::Overlay,
+        keyboard_interactivity: KeyboardInteractivity::Exclusive,
+        // Empty input region: clicks pass straight through it.
+        input_zone: Some(Vec::new()),
+        namespace: format!("{}.keyboard-focus", <AppModel as cosmic::Application>::APP_ID),
+        size: Some((Some(1), Some(1))),
+        exclusive_zone: -1,
+        ..SctkLayerSurfaceSettings::default()
     }
 }
 
@@ -494,7 +658,27 @@ mod tests {
             token_tx: None,
             pending_launch: None,
             power_menu_open: false,
+            keyboard_surface: None,
+            focused_surface: None,
+            pointer_inside_popup: false,
+            dismissed_at: None,
         }
+    }
+
+    /// Runs a task to completion and returns everything it emitted.
+    fn actions(task: Task<cosmic::Action<Message>>) -> Vec<RuntimeAction<cosmic::Action<Message>>> {
+        into_stream(task)
+            .map(|stream| block_on_stream(stream).collect())
+            .unwrap_or_default()
+    }
+
+    /// Opens the menu the way the runtime does: the popup is requested, then
+    /// the compositor confirms the surface exists. Returns what opening it
+    /// emitted once the surface existed.
+    fn open_menu(app: &mut AppModel) -> Vec<RuntimeAction<cosmic::Action<Message>>> {
+        let _ = app.update(Message::TogglePopup);
+        let popup = app.popup.expect("TogglePopup should have opened a popup");
+        actions(app.update(Message::SurfaceOpened(popup)))
     }
 
     /// A minimal stand-in for the search field's internal focus state,
@@ -549,20 +733,136 @@ mod tests {
     }
 
     #[test]
+    fn opening_the_menu_takes_keyboard_focus_through_an_exclusive_helper_surface() {
+        // cosmic-comp gives a freshly opened applet popup keyboard focus and
+        // takes it back ~200ms later, so focusing the search field alone
+        // left typing going nowhere. Only a layer surface asking for
+        // `Exclusive` interactivity keeps focus; it must also be invisible
+        // to clicks so it doesn't block the screen.
+        type HelperSettings = Box<dyn Fn(&mut AppModel) -> SctkLayerSurfaceSettings + Send + Sync>;
+
+        let mut app = test_app();
+        let emitted = open_menu(&mut app);
+
+        let helper = emitted
+            .into_iter()
+            .find_map(|action| match action {
+                RuntimeAction::Output(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
+                    cosmic::surface::Action::AppLayerShell(settings, _, _),
+                ))) => Some(settings),
+                _ => None,
+            })
+            .expect("opening the menu must open a keyboard helper surface");
+        let settings = helper.downcast_ref::<HelperSettings>().expect("layer-shell settings")(&mut app);
+
+        assert_eq!(Some(settings.id), app.keyboard_surface);
+        assert_eq!(settings.keyboard_interactivity, KeyboardInteractivity::Exclusive);
+        assert_eq!(
+            settings.input_zone,
+            Some(Vec::new()),
+            "the helper must let clicks through"
+        );
+    }
+
+    #[test]
+    fn the_popup_is_opened_without_a_grab() {
+        use cosmic::iced::runtime::platform_specific::{self, wayland};
+
+        // A grabbed popup is dismissed by the compositor as soon as the
+        // keyboard helper surface takes focus.
+        let mut app = test_app();
+        let grab = actions(app.update(Message::TogglePopup))
+            .into_iter()
+            .find_map(|action| match action {
+                RuntimeAction::PlatformSpecific(platform_specific::Action::Wayland(wayland::Action::Popup(
+                    wayland::popup::Action::Popup { popup },
+                ))) => Some(popup.grab),
+                _ => None,
+            });
+
+        assert_eq!(grab, Some(false));
+    }
+
+    #[test]
+    fn keys_the_search_field_never_saw_still_edit_the_query() {
+        let mut app = test_app();
+        let _ = open_menu(&mut app);
+
+        let _ = app.update(Message::SearchKey(SearchKey::Append("fi".into())));
+        let _ = app.update(Message::SearchKey(SearchKey::Append("x".into())));
+        let _ = app.update(Message::SearchKey(SearchKey::Backspace));
+
+        assert_eq!(app.search_query, "fi");
+    }
+
+    #[test]
+    fn escape_closes_the_menu_and_its_helper_surface() {
+        let mut app = test_app();
+        let _ = open_menu(&mut app);
+
+        let _ = app.update(Message::SearchKey(SearchKey::Dismiss));
+
+        assert_eq!(app.popup, None);
+        assert_eq!(app.keyboard_surface, None);
+    }
+
+    #[test]
+    fn focus_moving_to_another_app_closes_the_menu() {
+        let mut app = test_app();
+        let _ = open_menu(&mut app);
+        let popup = app.popup.unwrap();
+        let helper = app.keyboard_surface.unwrap();
+
+        let _ = app.update(Message::SurfaceFocused(helper));
+        let _ = app.update(Message::SurfaceUnfocused(helper));
+        let _ = app.update(Message::CloseIfUnfocused(popup));
+
+        assert_eq!(app.popup, None);
+        assert_eq!(app.keyboard_surface, None);
+    }
+
+    #[test]
+    fn focus_moving_from_the_helper_into_the_popup_keeps_the_menu_open() {
+        let mut app = test_app();
+        let _ = open_menu(&mut app);
+        let popup = app.popup.unwrap();
+        let helper = app.keyboard_surface.unwrap();
+
+        let _ = app.update(Message::SurfaceFocused(helper));
+        let _ = app.update(Message::SurfaceUnfocused(helper));
+        let _ = app.update(Message::SurfaceFocused(popup));
+        let _ = app.update(Message::CloseIfUnfocused(popup));
+
+        assert_eq!(app.popup, Some(popup));
+    }
+
+    #[test]
+    fn clicking_start_to_close_the_menu_does_not_reopen_it() {
+        // Clicking Start while the menu is open first moves focus away
+        // (closing the menu), then delivers the click as a toggle.
+        let mut app = test_app();
+        let _ = open_menu(&mut app);
+        let popup = app.popup.unwrap();
+        let helper = app.keyboard_surface.unwrap();
+
+        let _ = app.update(Message::SurfaceFocused(helper));
+        let _ = app.update(Message::SurfaceUnfocused(helper));
+        let _ = app.update(Message::CloseIfUnfocused(popup));
+        let _ = app.update(Message::TogglePopup);
+
+        assert_eq!(app.popup, None);
+    }
+
+    #[test]
     fn toggling_the_popup_never_touches_layer_surface_keyboard_interactivity() {
         use cosmic::iced::runtime::platform_specific::{self, wayland};
 
-        // KNOWN LIMITATION (see the comment on `Message::TogglePopup`'s open
-        // branch): typing into the search field still requires a click on
-        // it first; the popup's `xdg_popup` grab doesn't transfer real
-        // keyboard focus on cosmic-comp. Setting
-        // `KeyboardInteractivity::Exclusive` on the panel button's layer
-        // surface to try to work around that was tested and made things
-        // worse — cosmic-comp's focus-fixup pass rejects the popup as a
-        // focus target outright whenever the panel button's surface is
-        // Exclusive, and force-unsets the popup's own grab as a result. So
-        // opening or closing the popup must never touch the layer surface's
-        // keyboard interactivity.
+        // Setting `KeyboardInteractivity::Exclusive` on the panel button's
+        // own layer surface was tried once to get the menu keyboard focus.
+        // It made things worse: cosmic-comp then rejects the popup as a
+        // focus target outright. Only the separate helper surface (see
+        // `AppModel::capture_keyboard`) may ever have its interactivity
+        // changed, and only once it's focused — never on open or close.
         let mut app = test_app();
 
         let open_task = app.update(Message::TogglePopup);

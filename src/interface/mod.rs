@@ -4,4 +4,5 @@
 //! `application` only — never on `infrastructure` or `domain` directly.
 
 pub mod app;
+mod search_keys;
 mod widgets;
